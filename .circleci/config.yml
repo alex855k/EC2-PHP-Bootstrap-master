@@ -1,0 +1,153 @@
+env: &env
+  ENVIRONMENT: "dev"
+  REGION: "eu-central-1"
+  INSTANCE_TYPE: "t2.small"
+  MINIMUM_INSTANCES: 1
+default: &default
+  working_directory: ~/EC2-PHP-Bootstrap
+  docker:
+    - image: monosolutions/php71:latest
+
+version: 2
+jobs:
+  build:
+    working_directory: ~/EC2-PHP-Bootstrap
+    docker:
+      # specify the version you desire here
+      - image: monosolutions/php71:latest
+
+      # Specify service dependencies here if necessary
+      # CircleCI maintains a library of pre-built images
+      # documented at https://circleci.com/docs/2.0/circleci-images/
+      # - image: circleci/mysql:9.4
+    steps:
+      - checkout
+      - run: curl -sS https://getcomposer.org/installer | php
+      # Download and cache dependencies
+      - restore_cache:
+          keys:
+          - ec2-bootstrap-v1-dependencies-{{ checksum "composer.json" }}
+
+      - run: php composer.phar install -n --prefer-dist
+      - save_cache:
+          paths:
+            - ./vendor
+          key: ec2-bootstrap-v1-dependencies-{{ checksum "composer.json" }}
+      # run tests!
+      - run: bin/phpunit
+  shellcheck:
+    <<: *default
+    docker:
+      - image: trussworks/circleci-docker-primary:master
+    steps:
+      - checkout
+      - run:
+          name: Shellcheck
+          command: find ~/EC2-PHP-Bootstrap/deployment -name '*.sh' | xargs shellcheck
+  build-package:
+    <<: *default
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/EC2-PHP-Bootstrap
+      - run: ls -lah ./
+      - run: curl -sS https://getcomposer.org/installer | php
+      # Download and cache dependencies
+      - restore_cache:
+          keys:
+          - ec2-bootstrap-v1-dependencies-{{ checksum "composer.json" }}
+      - run: 
+          environment:
+            APP_ENV: "prod"
+            APP_SECRET: "65b596eb63750aabbdbbb784652d8469"
+          name: Optimize
+          command: |
+            php composer.phar install -n --prefer-dist --no-dev --optimize-autoloader
+      - run:
+          name: Build Artifact
+          command: |
+            mkdir -p ./artifact/app
+            DEPLOYABLE="${CIRCLE_PROJECT_REPONAME}-${CIRCLE_SHA1}.tar.gz"
+            echo $CIRCLE_SHA1 > ./artifact/version
+
+            rsync -a --exclude="tests" --exclude="deployment" --exclude="artifact" . ./artifact/app/.
+            
+            pushd ./artifact
+              echo "Taring ${DEPLOYABLE}"
+              tar -zcvf $DEPLOYABLE *
+            popd
+
+            cp -rf ./deployment ./artifact/
+      - persist_to_workspace:
+          root: ~/EC2-PHP-Bootstrap
+          paths: artifact
+  upload-package:
+    environment:
+      <<: *env
+    working_directory: ~/EC2-PHP-Bootstrap/artifact/deployment/app/
+    docker:
+      - image: monosolutions/awscli:latest
+    steps:
+      - attach_workspace:
+          at: ~/EC2-PHP-Bootstrap
+      - run:
+          name: Build Artifact Dev
+          command: |
+            aws configure set aws_access_key_id "${AWS_DEV_ACCESS_KEY}"
+            aws configure set aws_secret_access_key "${AWS_DEV_SECRET_KEY}"
+            sh publish-artifact.sh $ENVIRONMENT
+  deploy-to-dev:
+    docker:
+      - image: monosolutions/terraform:1.0.2
+    working_directory: ~/EC2-PHP-Bootstrap/artifact/deployment/app/
+    environment:
+      <<: *env
+    steps:
+      - attach_workspace:
+          at: ~/EC2-PHP-Bootstrap
+      - run:
+          name: Add github ssh key
+          command: |
+            mkdir -p ~/.ssh
+            echo 'github.com ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAq2A7hRGmdnm9tUDbO9IDSwBK6TbQa+PXYPCPy6rbTrTtw7PHkccKrpp0yVhp5HdEIcKr6pLlVDBfOLX9QUsyCOV0wzfjIJNlGEYsdlLJizHhbn2mUjvSAHQqZETYP81eFzLQNnPHt4EVVUh7VfDESU84KezmD5QlWpXLmvU31/yMf+Se8xhHTvKSCZIFImWwoG6mbUoWf9nzpIoaSjB+weqqUUmpaaasXVal72J+UX2B+2RPW3RcT0eOzQgqlJL3RKrTJvdsjE3JEAvGq3lGHSZXy28G3skua2SmVi/w4yCE6gbODqnTWlg7+wC604ydGXA8VJiS5ap43JXiUFFAaQ==
+            bitbucket.org ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAubiN81eDcafrgMeLzaFPsw2kNvEcqTKl/VqLat/MaB33pZy0y3rJZtnqwR2qOOvbwKZYKiEO1O6VqNEBxKvJJelCq0dTXWT5pbO2gDXC6h6QDXCaHo6pOHGPUy+YBaGQRGuSusMEASYiWunYN0vCAI8QaXnWMXNMdFP3jHAJH0eDsoiGnLPBlBp4TNm6rYI74nMzgz3B9IikW4WVK+dc8KZJZWYjAuORU3jc1c/NPskD2ASinf8v3xnfXeukU0sJ5N6m5E8VLjObPEO+mN2t/FZTMZLiFqPWc/ALSqnMnnhwrNi2rbfg/rd/IpL8Le3pSBne8+seeFVBoGqzHM9yXw==
+            ' >> ~/.ssh/known_hosts
+      - run:
+          name: Terraform init
+          command: |
+            terraform init \
+              -backend-config="access_key=${AWS_DEV_ACCESS_KEY}" \
+              -backend-config="secret_key=${AWS_DEV_SECRET_KEY}"
+            {
+              terraform workspace new $ENVIRONMENT
+            } || {
+              terraform workspace select $ENVIRONMENT
+            }
+      - run:
+          name: Plan to Dev
+          command: |
+            aws configure set aws_access_key_id "${AWS_DEV_ACCESS_KEY}"
+            aws configure set aws_secret_access_key "${AWS_DEV_SECRET_KEY}"
+            ls -lah
+            sh deploy.sh "${CIRCLE_SHA1}" "${ENVIRONMENT}" "${REGION}" "${INSTANCE_TYPE}" "${MINIMUM_INSTANCES}" "${CIRCLE_PROJECT_REPONAME}"
+      - run:
+          name: Deployment to Dev
+          command: |
+            terraform apply "plan-${CIRCLE_SHA1}.tfplan"
+     
+workflows:
+  version: 2
+  commit:
+    jobs:
+      - build
+      - shellcheck
+      - build-package:
+          requires:
+            - shellcheck
+            - build
+      - upload-package:
+          requires:
+            - build-package
+      - deploy-to-dev:
+          requires:
+            - upload-package

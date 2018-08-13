@@ -1,0 +1,12 @@
+parameters:
+    git_dir: .
+    bin_dir: vendor/bin
+    tasks:
+        phpcsfixer2:
+            config: .php_cs.dist
+        phplint: ~
+        phpstan:
+            level: 7
+        shell:
+            scripts:
+                - ["./bin/phpunit"]

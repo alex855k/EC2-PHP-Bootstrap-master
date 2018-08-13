@@ -1,0 +1,17 @@
+version: '2'
+
+services:
+  web:
+    image: nginx:latest
+    ports:
+      - "80:80"
+    volumes:
+      - .:/code
+      - ./config/nginx/conf.d/docker.conf:/etc/nginx/conf.d/site.conf
+    depends_on:
+      - php
+  php:
+    image: php_build
+    build: .
+    volumes:
+      - .:/code
